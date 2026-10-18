@@ -1,0 +1,7 @@
+# The word-lookup bundle patch: one row, whose package carries both halves.
+# The host half serves the dictionary-helper lookup route; the browser half
+# (`exports["./client"]`) is attached to this row by dsh-client-modules and owns the
+# composer control and the lookup panel.
+- insert:
+    - id: ui-speak-selection
+      name: 'dsh-plugin-word-lookup'
