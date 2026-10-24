@@ -75,17 +75,22 @@ The model lives on the Host, and the page cannot call it directly — the key is
 environment and no Remote exposes a secret. So the Host serves one route and the page calls it:
 
 ```
-POST /word-lookup/explain   { input }
+POST /word-lookup/explain   { input, model?, sessionId? }
   → { answer }
 ```
 
-`input` is the contents of the lookup box, trimmed and capped at 2000 characters. `answer` is
-dictionary-helper markdown, trimmed and capped at 12000 characters.
+`input` is the contents of the lookup box, trimmed and capped at 2000 characters. `model` is
+optional: the client sends the **session's currently selected** provider, model, and reasoning
+effort, so the lookup answers with the same model as the conversation. `sessionId` is the owning
+session's id; gateways that route requests by session (opencode-go expects it as
+`x-opencode-session`) reject a call without it. When the browser sends no usable selection, the
+Host falls back to the deployment default (`ctx.agentDefaultModel.currentSelection()`). `answer`
+is dictionary-helper markdown, trimmed and capped at 12000 characters.
 
-- **Host** (`lib/index.js`) registers the route on `ctx.webServer`, resolves the session's own
-  default route (`ctx.agentDefaultModel.currentSelection()`), and calls `ctx.llm.stream` with
-  the skill prompt.
-- **Client** (`lib/client.js`) posts the box contents, then renders the answer.
+- **Host** (`lib/index.js`) registers the route on `ctx.webServer`, takes the model route and
+  session id from the request (or the default), and calls `ctx.llm.stream` with the skill prompt.
+- **Client** (`lib/client.js`) reads the session id and model selection from the session-scoped
+  composer slot inject, posts the box contents with them, then renders the answer.
 
 Two details make this possible:
 
@@ -109,10 +114,9 @@ own trigger, so the Host adds one line:
   full sentence.*
 
 The prompt itself is the skill's grammar, formats, and style rules, condensed into one system
-message. The user turn ends with one more simplicity reminder, and the model call runs at a low
-temperature, because the beginner-English rule is the one a model drops most easily. Nothing is
-read from the skills directory at run time, so the plugin works even if that directory is not
-installed.
+message. The user turn ends with one more simplicity reminder, because the beginner-English rule
+is the one a model drops most easily. Nothing is read from the skills directory at run time, so
+the plugin works even if that directory is not installed.
 
 ### Empty answers
 
@@ -140,14 +144,15 @@ markdown library in the plugin; the renderer is a short function at the bottom o
 
 ### Caching
 
-Answers are cached in the page for the life of the tab, keyed by **the lookup text**:
+Answers are cached in the page for the life of the tab, keyed by **the lookup text and the
+model route**:
 
 ```js
-explainCache.get(input)
+explainCacheKey(input, model)
 ```
 
 The box contents include the sentence, so the same word in a different sentence is a different
-entry. The cache holds up to 60 answers (oldest evicted), never reaches disk, and stores only
+entry; the route is part of the key because the same text under another model is another answer. The cache holds up to 60 answers (oldest evicted), never reaches disk, and stores only
 successful answers. An entry **expires 30 minutes after it was fetched**
 (`EXPLAIN_CACHE_TTL_MS`), checked on read, so a tab left open overnight never serves yesterday's
 answer. **⟳** deletes the entry and refetches.
@@ -192,6 +197,12 @@ layer is click-through, so every element opts back into pointer events.
   trigger's `mousedown` is prevented for the same reason, and the last eligible selection is
   kept as a fallback. The clipboard is read **only** when there is no selection, so an ordinary
   click never asks the browser for it.
+- **Model and session.** The composer control is session-scoped, so the slot's `inject` hands it
+  the session id and that session's model directory; the click reads the store's current provider,
+  model, and reasoning effort and the Host calls exactly that route with the session id. A session
+  that switched models keeps working even when the deployment default is stale, and session-routed
+  gateways receive the header they require. Only when no selection is available does the Host fall
+  back to the default.
 - **The sentence around a selection.** The anchor node is walked up to the nearest block-level
   element (`p`, `li`, `blockquote`, `pre`, a table cell, a heading), the block's `innerText` is
   collapsed, and the sentence holding the selection is cut out. Sentence ends are `.!?` followed
@@ -297,8 +308,10 @@ node .dsh-probe/render-test.mjs    # prefill, Explain, markdown, speak, reload, 
   secret injected into the page.
 - **The explanation is generated, so it can be wrong.** It follows the dictionary-helper
   skill, not a fixed dictionary database.
-- **One model call per Explain**, two when the first reply is empty. Cached per lookup text
-  afterwards; **⟳** forces a fresh one.
+- **One model call per Explain**, two when the first reply is empty. Cached per lookup text and
+  model afterwards; **⟳** forces a fresh one.
+- **A session with no model selection** uses the deployment default. If that default is
+  unavailable, Explain reports the model error for that route.
 - **System voice quality.** These are the OS voices, not a cloud model. Voice and rate are
   fixed at the engine default.
 - **English and Chinese UI copy.** Those are the two built-in Client locales; the dictionary

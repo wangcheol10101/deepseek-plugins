@@ -136,4 +136,23 @@ const res = {
 await route.handler({ method: "GET", on() {} }, res);
 assert.equal(res.statusCode, 405);
 
+// A model route from the browser overrides the deployment default.
+answers.push(["**override**"]);
+response = await post({ input: "override", sessionId: "session-test", model: { provider: "opencode-go", model: "deepseek-v4.1-flash", reasoningEffort: "max" } });
+assert.equal(response.status, 200);
+assert.equal(response.body.answer, "**override**");
+const override = calls.at(-1);
+assert.equal(override.provider, "opencode-go");
+assert.equal(override.model, "deepseek-v4.1-flash");
+assert.equal(override.reasoningEffort, "max");
+assert.equal(override.sessionId, "session-test");
+assert.equal(override.temperature, void 0, "temperature is no longer sent");
+
+// A malformed route is ignored and the default is used.
+answers.push(["**fallback**"]);
+response = await post({ input: "fallback", model: { provider: "", model: "" } });
+assert.equal(response.status, 200);
+assert.equal(calls.at(-1).provider, "p");
+assert.equal(calls.at(-1).model, "m");
+
 console.log("host test: all assertions passed");

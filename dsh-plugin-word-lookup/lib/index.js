@@ -155,6 +155,35 @@ function readInput(value) {
 }
 
 /**
+ * Read an optional model route from the browser. The composer sends the model
+ * its session is currently using, so a lookup answers with the same model as
+ * the conversation; an absent or malformed route falls back to the default.
+ * @param value - candidate field.
+ * @returns the provider, model, and optional reasoning effort, or null.
+ */
+function readModel(value) {
+	if (value === null || typeof value !== "object") return null;
+	const provider = typeof value.provider === "string" ? value.provider.trim().slice(0, 200) : "";
+	const model = typeof value.model === "string" ? value.model.trim().slice(0, 200) : "";
+	if (provider.length === 0 || model.length === 0) return null;
+	const reasoningEffort = typeof value.reasoningEffort === "string" ? value.reasoningEffort.trim().slice(0, 40) : "";
+	return reasoningEffort.length === 0 ? { provider, model } : { provider, model, reasoningEffort };
+}
+
+/**
+ * Read the optional owning session id. Some gateways (opencode-go) route a
+ * request by it, so the same id the conversation uses must travel with the
+ * lookup.
+ * @param value - candidate field.
+ * @returns the trimmed session id, or null.
+ */
+function readSessionId(value) {
+	if (typeof value !== "string") return null;
+	const id = value.trim().slice(0, 200);
+	return id.length === 0 ? null : id;
+}
+
+/**
  * Remove the fence a model sometimes wraps around a whole answer, and trim it.
  * @param raw - the model's text.
  * @returns the answer text.
@@ -206,11 +235,14 @@ function send(res, status, payload) {
 }
 
 /**
- * Resolve the provider route the session already uses.
+ * Resolve the model route to call: the session's selection when the browser
+ * sent one, otherwise the deployment default.
  * @param ctx - owning Host Context.
- * @returns the exact provider and model to call.
+ * @param requested - the route the browser sent, or null.
+ * @returns the exact provider, model, and optional effort to call.
  */
-function resolveRoute(ctx) {
+function resolveRoute(ctx, requested) {
+	if (requested !== null) return requested;
 	const selection = ctx.agentDefaultModel.currentSelection();
 	const route = selection?.route ?? selection;
 	const provider = route?.provider;
@@ -218,7 +250,9 @@ function resolveRoute(ctx) {
 	if (typeof provider !== "string" || provider.length === 0 || typeof model !== "string" || model.length === 0) {
 		throw new Error("no default model route is configured");
 	}
-	return { provider, model };
+	return typeof route.reasoningEffort === "string" && route.reasoningEffort.length > 0
+		? { provider, model, reasoningEffort: route.reasoningEffort }
+		: { provider, model };
 }
 
 /**
@@ -228,10 +262,10 @@ function resolveRoute(ctx) {
  * @param prompt - the user turn.
  * @returns the collected reply text.
  */
-async function askModel(ctx, route, prompt) {
+async function askModel(ctx, route, sessionId, prompt) {
 	let output = "";
 	let failure;
-	for await (const chunk of ctx.llm.stream({
+	const request = {
 		provider: route.provider,
 		model: route.model,
 		system: SYSTEM,
@@ -243,12 +277,17 @@ async function askModel(ctx, route, prompt) {
 			}]
 		}],
 		maxTokens: MAX_TOKENS,
-		temperature: 0.2
-	})) {
+		...(route.reasoningEffort === void 0 ? {} : { reasoningEffort: route.reasoningEffort }),
+		...(sessionId === null ? {} : { sessionId })
+	};
+	for await (const chunk of ctx.llm.stream(request)) {
 		if (chunk.type === "text-delta") output += chunk.text;
 		else if (chunk.type === "finish" && chunk.reason.kind === "error") failure = chunk.reason.failure;
 	}
-	if (failure !== undefined) throw new Error(`the model call failed (${failure.code})`);
+	if (failure !== undefined) {
+		const detail = typeof failure.message === "string" && failure.message.length > 0 ? `: ${failure.message.slice(0, 240)}` : "";
+		throw new Error(`the model call failed (${failure.code}${detail}) for ${route.provider}/${route.model}`);
+	}
 	return output;
 }
 
@@ -275,14 +314,14 @@ function promptFor(input) {
  * @param input - the lookup text.
  * @returns the markdown answer.
  */
-async function explain(ctx, input) {
-	const route = resolveRoute(ctx);
+async function explain(ctx, input, requestedModel, sessionId) {
+	const route = resolveRoute(ctx, requestedModel);
 	const prompt = promptFor(input);
-	let answer = cleanAnswer(await askModel(ctx, route, prompt));
+	let answer = cleanAnswer(await askModel(ctx, route, sessionId, prompt));
 	// One more sample when the reply is empty: the output is generated, and a second
 	// attempt is usually well formed. An answer that is still empty is an error, never
 	// the raw reply — an empty card is not an explanation.
-	if (answer.length < 2) answer = cleanAnswer(await askModel(ctx, route, prompt));
+	if (answer.length < 2) answer = cleanAnswer(await askModel(ctx, route, sessionId, prompt));
 	if (answer.length < 2) throw new Error("the model did not answer with an explanation");
 	return { answer };
 }
@@ -311,7 +350,7 @@ function handlerFor(ctx) {
 			return;
 		}
 		try {
-			send(res, 200, await explain(ctx, input));
+			send(res, 200, await explain(ctx, input, readModel(body?.model), readSessionId(body?.sessionId)));
 		} catch (error) {
 			send(res, 502, { error: String(error?.message ?? error) });
 		}

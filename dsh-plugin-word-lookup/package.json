@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-word-lookup",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Look up a word, idiom, or sentence in the composer, explain it with dictionary-helper, and read it aloud",
   "keywords": [
     "dsh",

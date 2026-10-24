@@ -260,11 +260,35 @@ window.__ModuleLoader__.load({
 		const EXPLAIN_CACHE_LIMIT = 60;
 		/** How long one answer stays usable before it is fetched again. */
 		const EXPLAIN_CACHE_TTL_MS = 30 * 60 * 1000;
-		/** Answers already fetched in this page run, keyed by the lookup text. */
+		/** Answers already fetched in this page run, keyed by the lookup text and model. */
 		const explainCache = new Map();
 		/**
+		* Normalize one model selection from the session's model store.
+		* @param value - candidate selection.
+		* @returns provider, model, and optional effort, or null.
+		*/
+		function modelOf(value) {
+			if (value === null || typeof value !== "object") return null;
+			const provider = typeof value.provider === "string" ? value.provider.trim() : "";
+			const model = typeof value.model === "string" ? value.model.trim() : "";
+			if (provider.length === 0 || model.length === 0) return null;
+			const reasoningEffort = typeof value.reasoningEffort === "string" ? value.reasoningEffort.trim() : "";
+			return reasoningEffort.length === 0 ? { provider, model } : { provider, model, reasoningEffort };
+		}
+		/**
+		* Identity of one cached answer. The same text under another model is a
+		* different answer, so the route belongs in the key.
+		* @param input - the lookup text.
+		* @param model - the route used for the request, or null for the default.
+		* @returns the cache key.
+		*/
+		function explainCacheKey(input, model) {
+			if (model === null) return input + "\u0000default";
+			return input + "\u0000" + model.provider + "/" + model.model + "/" + (model.reasoningEffort ?? "");
+		}
+		/**
 		* Read one answer out of the run cache, discarding it once it is too old.
-		* @param key - lookup text.
+		* @param key - lookup text and model identity.
 		* @returns the cached answer, or undefined.
 		*/
 		function explainCacheGet(key) {
@@ -295,14 +319,19 @@ window.__ModuleLoader__.load({
 		* Ask the Host to explain one lookup. The Host calls the model, so the answer
 		* never becomes a conversation message.
 		* @param input - the lookup text.
+		* @param model - the session's model route, or null to use the default.
+		* @param sessionId - the owning session id, required by some gateways.
 		* @param signal - caller cancellation.
 		* @returns the markdown answer.
 		*/
-		async function fetchExplanation(input, signal) {
+		async function fetchExplanation(input, model, sessionId, signal) {
+			const body = { input };
+			if (model !== null) body.model = model;
+			if (sessionId !== null) body.sessionId = sessionId;
 			const response = await fetch(EXPLAIN_ROUTE, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ input }),
+				body: JSON.stringify(body),
 				signal
 			});
 			const payload = await response.json().catch(() => null);
@@ -632,10 +661,14 @@ window.__ModuleLoader__.load({
 						composerBridge.open({
 							rect,
 							selection: null,
-							clipboard: ""
+							clipboard: "",
+							model: null,
+							sessionId: null
 						});
 						return;
 					}
+					const model = typeof props.modelSelection === "function" ? modelOf(props.modelSelection()) : null;
+					const sessionId = typeof props.sessionId === "string" ? props.sessionId : null;
 					const selection = readSelection() ?? lastSelection.value;
 					// The clipboard is only read when there is nothing selected, so a plain
 					// click never asks the browser for it.
@@ -643,7 +676,9 @@ window.__ModuleLoader__.load({
 					composerBridge.open({
 						rect,
 						selection,
-						clipboard
+						clipboard,
+						model,
+						sessionId
 					});
 				}
 			}, icon(ICON_EXPLAIN));
@@ -771,7 +806,7 @@ window.__ModuleLoader__.load({
 					data: null,
 					message: ""
 				});
-				setPanel({ rect: payload.rect });
+				setPanel({ rect: payload.rect, model: payload.model ?? null, sessionId: payload.sessionId ?? null });
 				setDraft(payload.selection !== null ? inputFromSelection(payload.selection) : payload.clipboard);
 			}, [close, stop]);
 
@@ -845,15 +880,20 @@ window.__ModuleLoader__.load({
 			* @param rect - where to place the panel and a notice.
 			* @param lang - the language of the text, for speech.
 			* @param cached - whether a cached answer may be shown instead.
+			* @param model - the session's model route, or null for the default.
+			* @param sessionId - the owning session id, or null.
 			*/
-			const askFor = async (input, rect, lang, cached) => {
+			const askFor = async (input, rect, lang, cached, model, sessionId) => {
+				const key = explainCacheKey(input, model);
 				if (cached) {
-					const hit = explainCacheGet(input);
+					const hit = explainCacheGet(key);
 					if (hit !== void 0) {
 						setAsk({
 							input,
 							rect,
-							lang
+							lang,
+							model,
+							sessionId
 						});
 						setExplain({
 							status: "ready",
@@ -870,7 +910,9 @@ window.__ModuleLoader__.load({
 				setAsk({
 					input,
 					rect,
-					lang
+					lang,
+					model,
+					sessionId
 				});
 				setExplain({
 					status: "loading",
@@ -878,9 +920,9 @@ window.__ModuleLoader__.load({
 					message: ""
 				});
 				try {
-					const data = await fetchExplanation(input, controller.signal);
+					const data = await fetchExplanation(input, model, sessionId, controller.signal);
 					if (controller.signal.aborted) return;
-					explainCacheSet(input, data);
+					explainCacheSet(key, data);
 					setExplain({
 						status: "ready",
 						data,
@@ -908,7 +950,9 @@ window.__ModuleLoader__.load({
 				}
 				setPanelNote(null);
 				stop();
-				void askFor(input, panel.rect, detectLang(input), true);
+				const model = typeof panel.model === "function" ? modelOf(panel.model()) : modelOf(panel.model);
+				const sessionId = typeof panel.sessionId === "string" ? panel.sessionId : null;
+				void askFor(input, panel.rect, detectLang(input), true, model, sessionId);
 			};
 
 			/**
@@ -1001,8 +1045,8 @@ window.__ModuleLoader__.load({
 									path: ICON_REFRESH,
 									label: t("refresh"),
 									onActivate: () => {
-										explainCache.delete(ask.input);
-										void askFor(ask.input, ask.rect, ask.lang, false);
+										explainCache.delete(explainCacheKey(ask.input, ask.model));
+										void askFor(ask.input, ask.rect, ask.lang, false, ask.model, ask.sessionId);
 									}
 								})
 							])
@@ -1085,7 +1129,19 @@ window.__ModuleLoader__.load({
 				id: "word-lookup-tools",
 				order: 80,
 				label: "Word lookup",
-				locale: NS
+				locale: NS,
+				inject: (sessionId) => {
+					const props = { sessionId };
+					const directories = ctx.get("modelDirectories");
+					if (directories === void 0) return props;
+					try {
+						const directory = directories.directoryFor(sessionId);
+						props.modelSelection = () => directory.store.getSnapshot().current;
+					} catch (_error) {
+						// No model selection; the Host falls back to its default.
+					}
+					return props;
+				}
 			}, ComposerTextTools)));
 		}
 		exports.apply = apply;
